@@ -108,6 +108,7 @@ class PromptDecisionTransformer(nn.Module):
             ).permute(0, 2, 1).reshape(prompt_states.shape[0], 3 * prompt_seq_length)
 
             # stacked_inputs add prompted sequence
+            # breakpoint()
             if prompt_stacked_inputs.shape[1] == 3 * seq_length: # if only smaple one prompt
                 prompt_stacked_inputs = prompt_stacked_inputs.reshape(1, -1, self.hidden_size)
                 prompt_stacked_attention_mask = prompt_stacked_attention_mask.reshape(1, -1)
@@ -116,6 +117,7 @@ class PromptDecisionTransformer(nn.Module):
             else: # if sample one prompt for each traj in batch
                 stacked_inputs = torch.cat((prompt_stacked_inputs, stacked_inputs), dim=1)
                 stacked_attention_mask = torch.cat((prompt_stacked_attention_mask, stacked_attention_mask), dim=1)
+            # breakpoint()
         # we feed in the input embeddings (not word indices as in NLP) to the model
         transformer_outputs = self.transformer(
             inputs_embeds=stacked_inputs,
@@ -140,7 +142,7 @@ class PromptDecisionTransformer(nn.Module):
 
     def get_action(self, states, actions, rewards, returns_to_go, timesteps, **kwargs):
         # we don't care about the past rewards in this model
-
+        # breakpoint()
         states = states.reshape(1, -1, self.state_dim)
         actions = actions.reshape(1, -1, self.act_dim)
         returns_to_go = returns_to_go.reshape(1, -1, 1)

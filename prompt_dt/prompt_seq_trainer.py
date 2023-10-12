@@ -7,12 +7,13 @@ import time
 from wandb import env
 from .prompt_utils import flatten_prompt
 import copy
+from tqdm import tqdm
 
 
 class PromptSequenceTrainer:
 
     def __init__(self, model, optimizer, batch_size, get_batch, loss_fn,
-                 scheduler=None, eval_fns=None, get_prompt=None, get_prompt_batch=None):
+                 scheduler=None, eval_fns=None, get_prompt=None, get_prompt_batch=None, shift_action=False):
         self.model = model
         self.optimizer = optimizer
         self.batch_size = batch_size
@@ -25,18 +26,19 @@ class PromptSequenceTrainer:
         self.prompt = self.get_prompt() # sample prompt data when initialization
         self.get_prompt_batch = get_prompt_batch
 
+        self.shift_action = shift_action
+
         self.start_time = time.time()
 
-
     def pure_train_iteration_mix(self, num_steps, no_prompt=False):
-
+        
         train_losses = []
         logs = dict()
 
         train_start = time.time()
 
         self.model.train()
-        for _ in range(num_steps):
+        for _ in tqdm(range(num_steps)):
             train_loss = self.train_step_mix(no_prompt)
             train_losses.append(train_loss)
             if self.scheduler is not None:
@@ -51,11 +53,15 @@ class PromptSequenceTrainer:
 
         return logs
 
-
+    # @torch.compile
     def train_step_mix(self, no_prompt=False):
+        # breakpoint()
         prompt, batch = self.get_prompt_batch()
         states, actions, rewards, dones, rtg, timesteps, attention_mask = batch
         action_target = torch.clone(actions)
+        if self.shift_action:
+            action_target = action_target[:, 1:, :]
+
         if no_prompt:
             state_preds, action_preds, reward_preds = self.model.forward(
                 states, actions, rewards, rtg[:,:-1], timesteps, attention_mask=attention_mask, prompt=None
@@ -83,7 +89,6 @@ class PromptSequenceTrainer:
             self.diagnostics['training/action_error'] = torch.mean((action_preds-action_target)**2).detach().cpu().item()
 
         return loss.detach().cpu().item()
-
 
     def finetune_eval_iteration_multienv(self, get_prompt, get_batch, test_prompt_trajectories_list, test_trajectories_list, 
                                 eval_episodes, env_name_list, info, 
@@ -145,13 +150,15 @@ class PromptSequenceTrainer:
 
         return logs
 
-
+    # @torch.compile
     def train_step(self, batch_size_overwrite=None, optimizer=None):
         if batch_size_overwrite is not None:
             states, actions, rewards, dones, rtg, timesteps, attention_mask = self.get_batch(batch_size_overwrite)
         else:
             states, actions, rewards, dones, rtg, timesteps, attention_mask = self.get_batch(self.batch_size)
         action_target = torch.clone(actions)
+        if self.shift_action:
+            action_target = action_target[:, 1:, :]
         # print('state shape after batch', states.shape)
         # print('self.batch_size', self.batch_size)
         # print('enter train step')
@@ -186,7 +193,6 @@ class PromptSequenceTrainer:
             self.diagnostics['training/action_error'] = torch.mean((action_preds-action_target)**2).detach().cpu().item()
 
         return loss.detach().cpu().item()
-
 
     def eval_iteration_multienv(self, get_prompt, prompt_trajectories_list, eval_episodes, env_name_list, info, 
                                 variant, env_list, iter_num=0, print_logs=False, no_prompt=False, group='test'):

@@ -1,5 +1,6 @@
 from ast import parse
-import gym
+# import gym
+import gymnasium
 import numpy as np
 import torch
 import wandb
@@ -11,15 +12,18 @@ import sys
 import time
 import itertools
 
-from prompt_dt.prompt_decision_transformer import PromptDecisionTransformer
+# from prompt_dt.prompt_decision_transformer import PromptDecisionTransformer
+from prompt_dt.graph_prompt_decision_transformer import GPDT_V2_Torch
 from prompt_dt.prompt_seq_trainer import PromptSequenceTrainer
 from prompt_dt.prompt_utils import get_env_list
 from prompt_dt.prompt_utils import get_prompt_batch, get_prompt, get_batch, get_batch_finetune
 from prompt_dt.prompt_utils import process_total_data_mean, load_data_prompt, process_info
-from prompt_dt.prompt_utils import eval_episodes
+from prompt_dt.prompt_utils import eval_episodes, get_agent_config
 
 from collections import namedtuple
 import json, pickle, os
+
+import pdb
 
 def experiment_mix_env(
         exp_prefix,
@@ -27,6 +31,10 @@ def experiment_mix_env(
 ):
     device = variant['device']
     log_to_wandb = variant['log_to_wandb']
+    if variant['model_type'] == 'gpdt_v2' or variant['model_type'] == 'gpdt_v3':
+        variant['shift_action'] = True
+    else:
+        variant['shift_action'] = False
 
     ######
     # construct train and test environments
@@ -43,7 +51,23 @@ def experiment_mix_env(
         'cheetah_dir': "cheetah_dir/cheetah_dir_2.json",
         'ant_dir': "ant_dir/ant_dir_50.json",
         'ML1-pick-place-v2': "ML1-pick-place-v2/ML1_pick_place.json",
+        'snake_dir': "snake_dir/snake_dir_10.json",
+        'snake_3_to_4_dir': "snake_3_to_4_dir/snake_3_to_4_dir_10.json"
     }
+    
+    if args.env == 'cheetah_dir' or args.env == 'cheetah_vel': # ['cheetah_dir', 'cheetah_vel', 'ant_dir', 'ML1-pick-place-v2']
+        agent_name = 'halfcheetah'
+        agent = get_agent_config(agent_name)
+    elif args.env == 'ant_dir':
+        agent_name = 'ant'
+        agent = get_agent_config(agent_name)
+    elif args.env == 'snake_dir' or args.env == 'snake_3_to_4_dir':
+        agent_name = 'snake'
+        agent = get_agent_config(agent_name)
+    else:
+        print(f'{args.env} not implement yet in agent_config, ignore if using original pdt')
+        # raise NotImplementedError
+    
     
     task_config = os.path.join(config_save_path, config_path_dict[args.env])
     with open(task_config, 'r') as f:
@@ -55,11 +79,13 @@ def experiment_mix_env(
         test_env_name_list.append(args.env +'-'+ str(task_ind))
     # training envs
     info, env_list = get_env_list(train_env_name_list, config_save_path, device)
+    # pdb.set_trace()
     # testing envs
     test_info, test_env_list = get_env_list(test_env_name_list, config_save_path, device)
 
     print(f'Env Info: {info} \n\n Test Env Info: {test_info}\n\n\n')
     print(f'Env List: {env_list} \n\n Test Env List: {test_env_list}')
+
     ######
     # process train and test datasets
     ######
@@ -78,6 +104,8 @@ def experiment_mix_env(
     # load testing dataset
     test_trajectories_list, test_prompt_trajectories_list = load_data_prompt(test_env_name_list, data_save_path, test_dataset_mode, test_prompt_mode, args)
 
+    # pdb.set_trace()
+    
     # change to total train trajecotry 
     if variant['average_state_mean']:
         train_total = list(itertools.chain.from_iterable(trajectories_list))
@@ -93,6 +121,7 @@ def experiment_mix_env(
     # process test info
     test_info = process_info(test_env_name_list, test_trajectories_list, test_info, mode, test_dataset_mode, pct_traj, variant)
 
+    # pdb.set_trace()
     ######
     # construct dt model and trainer
     ######
@@ -104,21 +133,32 @@ def experiment_mix_env(
 
     state_dim = test_env_list[0].observation_space.shape[0]
     act_dim = test_env_list[0].action_space.shape[0]
-
-    model = PromptDecisionTransformer(
-        state_dim=state_dim,
-        act_dim=act_dim,
-        max_length=K,
-        max_ep_len=1000,
-        hidden_size=variant['embed_dim'],
-        n_layer=variant['n_layer'],
-        n_head=variant['n_head'],
-        n_inner=4 * variant['embed_dim'],
-        activation_function=variant['activation_function'],
-        n_positions=1024,
-        resid_pdrop=variant['dropout'],
-        attn_pdrop=variant['dropout'],
-    )
+    
+    if variant['model_type'] == 'pdt':
+        model = PromptDecisionTransformer(
+            state_dim=state_dim,
+            act_dim=act_dim,
+            max_length=K,
+            max_ep_len=1000,
+            hidden_size=variant['embed_dim'],
+            n_layer=variant['n_layer'],
+            n_head=variant['n_head'],
+            n_inner=4 * variant['embed_dim'],
+            activation_function=variant['activation_function'],
+            n_positions=1024,
+            resid_pdrop=variant['dropout'],
+            attn_pdrop=variant['dropout'],
+        )
+    elif variant['model_type'] == 'gpdt_v2':
+        model = GPDT_V2_Torch(
+            agent=agent,
+            max_length=K,
+            max_ep_length=1000,
+            prompt_length=variant['prompt_length'],
+            hidden_size=variant['embed_dim'],
+            n_layers=variant['n_layer'],
+            dropout=variant['dropout'],
+        )
     model = model.to(device=device)
 
     warmup_steps = variant['warmup_steps']
@@ -142,7 +182,8 @@ def experiment_mix_env(
         loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a) ** 2),
         eval_fns=None,
         get_prompt=get_prompt(prompt_trajectories_list[0], info[env_name], variant),
-        get_prompt_batch=get_prompt_batch(trajectories_list, prompt_trajectories_list, info, variant, train_env_name_list)
+        get_prompt_batch=get_prompt_batch(trajectories_list, prompt_trajectories_list, info, variant, train_env_name_list),
+        shift_action=variant['shift_action'],
     )
 
 
@@ -172,6 +213,7 @@ def experiment_mix_env(
         for iter in range(variant['max_iters']):
             env_id = iter % num_env
             env_name = train_env_name_list[env_id]
+            # breakpoint()
             outputs = trainer.pure_train_iteration_mix(
                 num_steps=variant['num_steps_per_iter'], 
                 no_prompt=args.no_prompt
@@ -276,6 +318,8 @@ if __name__ == '__main__':
     parser.add_argument('--train_eval_interval', type=int, default=500)
     parser.add_argument('--test_eval_interval', type=int, default=100)
     parser.add_argument('--save-interval', type=int, default=500)
+    
+    parser.add_argument('--model_type', type=str, default='pdt')
 
     args = parser.parse_args()
     experiment_mix_env('gym-experiment', variant=vars(args))

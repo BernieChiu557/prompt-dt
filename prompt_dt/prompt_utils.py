@@ -1,17 +1,21 @@
 import numpy as np
-import gym
+# import gym
+import gymnasium as gym
 import json, pickle, random, os, torch
 from collections import namedtuple
 from .prompt_evaluate_episodes import prompt_evaluate_episode, prompt_evaluate_episode_rtg
 
 # for mujoco tasks
 from mujoco_control_envs.mujoco_control_envs import HalfCheetahDirEnv, HalfCheetahVelEnv, AntDirEnv
+# import nervenet_envs
+# todo: add support of Centipede
+
 # for jacopinpad
-from jacopinpad.jacopinpad_gym import jacopinpad_multi
+# from jacopinpad.jacopinpad_gym import jacopinpad_multi
 # for metaworld
-import metaworld
-from metaworld.envs import (ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE,
-                            ALL_V2_ENVIRONMENTS_GOAL_HIDDEN)
+# import metaworld
+# from metaworld.envs import (ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE,
+#                             ALL_V2_ENVIRONMENTS_GOAL_HIDDEN)
 
 """ constructing envs """
 
@@ -42,6 +46,7 @@ def gen_env(env_name, config_save_path):
         tasks = []
         with open(task_paths.format(task_idx), 'rb') as f:
             task_info = pickle.load(f)
+            print(task_info)
             assert len(task_info) == 1, f'Unexpected task info: {task_info}'
             tasks.append(task_info[0])
         env = AntDirEnv(tasks, len(tasks), include_goal = False)
@@ -58,6 +63,21 @@ def gen_env(env_name, config_save_path):
         max_ep_len = 500 
         env_targets= [int(650)]
         scale = 650.
+    elif 'snake_dir' in env_name:
+        length = int(env_name.split('-')[-2])
+        task_idx = int(env_name.split('-')[-1])
+        task_paths = f"{config_save_path}/snake_dir/config_snake{length}_dir_task{task_idx}.pkl"
+        tasks = []
+        with open(task_paths.format(task_idx), 'rb') as f:
+            task_info = pickle.load(f)
+            assert len(task_info) == 1, f'Unexpected task info: {task_info}'
+            tasks.append(task_info[0])
+        env = gym.make('SnakeDir-v0', pod_number=length, tasks=tasks, n_tasks=len(tasks), include_goal = False)
+        max_ep_len = 1000
+
+        # what does these two var below do?
+        env_targets = [500]
+        scale = 500.
     else:
         raise NotImplementedError
     return env, max_ep_len, env_targets, scale
@@ -100,6 +120,8 @@ def get_prompt(prompt_trajectories, info, variant):
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
     num_episodes, max_len = variant['prompt_episode'], variant['prompt_length']
+    shift_action = variant['shift_action']
+    # breakpoint()
 
     def fn(sample_size=1):
         # random sample prompts with fixed length (prompt-length) in num episodes (prompt-episode)
@@ -121,7 +143,10 @@ def get_prompt(prompt_trajectories, info, variant):
 
             # get sequences from dataset
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
-            a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
+            if shift_action and si > 0:
+                a.append(traj['actions'][si-1:si + max_len].reshape(1, -1, act_dim))
+            else:
+                a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
             if 'terminals' in traj:
                 d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
@@ -135,12 +160,16 @@ def get_prompt(prompt_trajectories, info, variant):
 
             # padding and state + reward normalization
             tlen = s[-1].shape[1]
+            alen = a[-1].shape[1]
             # if tlen !=args.K:
             #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
-            a[-1] = np.concatenate([np.ones((1, max_len - tlen, act_dim)) * -10., a[-1]], axis=1)
+            if shift_action:
+                a[-1] = np.concatenate([np.ones((1, 1 + max_len - alen, act_dim)) * -10., a[-1]], axis=1)
+            else:
+                a[-1] = np.concatenate([np.ones((1, max_len - alen, act_dim)) * -10., a[-1]], axis=1)
             r[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), r[-1]], axis=1)
             d[-1] = np.concatenate([np.ones((1, max_len - tlen)) * 2, d[-1]], axis=1)
             rtg[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), rtg[-1]], axis=1) / scale
@@ -211,6 +240,7 @@ def get_batch(trajectories, info, variant):
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
     batch_size, K = variant['batch_size'], variant['K']
+    shift_action = variant['shift_action']
 
     def fn(batch_size=batch_size, max_len=K):
         batch_inds = np.random.choice(
@@ -227,7 +257,10 @@ def get_batch(trajectories, info, variant):
 
             # get sequences from dataset
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
-            a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
+            if shift_action and si > 0:
+                a.append(traj['actions'][si-1:si + max_len].reshape(1, -1, act_dim))
+            else:
+                a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
             if 'terminals' in traj:
                 d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
@@ -241,12 +274,16 @@ def get_batch(trajectories, info, variant):
 
             # padding and state + reward normalization
             tlen = s[-1].shape[1]
+            alen = a[-1].shape[1]
             # if tlen !=args.K:
             #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
-            a[-1] = np.concatenate([np.ones((1, max_len - tlen, act_dim)) * -10., a[-1]], axis=1)
+            if shift_action:
+                a[-1] = np.concatenate([np.ones((1, 1 + max_len - alen, act_dim)) * -10., a[-1]], axis=1)
+            else:
+                a[-1] = np.concatenate([np.ones((1, max_len - alen, act_dim)) * -10., a[-1]], axis=1)
             r[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), r[-1]], axis=1)
             d[-1] = np.concatenate([np.ones((1, max_len - tlen)) * 2, d[-1]], axis=1)
             rtg[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), rtg[-1]], axis=1) / scale
@@ -271,6 +308,7 @@ def get_batch_finetune(trajectories, info, variant):
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
     batch_size, K = variant['batch_size'], variant['prompt_length'] # use the same amount of data for funetuning
+    shift_action = variant['shift_action']
 
     def fn(batch_size=batch_size, max_len=K):
         batch_inds = np.random.choice(
@@ -288,7 +326,10 @@ def get_batch_finetune(trajectories, info, variant):
 
             # get sequences from dataset
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
-            a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
+            if shift_action and si > 0:
+                a.append(traj['actions'][si-1:si + max_len].reshape(1, -1, act_dim))
+            else:
+                a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
             if 'terminals' in traj:
                 d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
@@ -302,12 +343,16 @@ def get_batch_finetune(trajectories, info, variant):
 
             # padding and state + reward normalization
             tlen = s[-1].shape[1]
+            alen = a[-1].shape[1]
             # if tlen !=args.K:
             #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
-            a[-1] = np.concatenate([np.ones((1, max_len - tlen, act_dim)) * -10., a[-1]], axis=1)
+            if shift_action:
+                a[-1] = np.concatenate([np.ones((1, 1 + max_len - alen, act_dim)) * -10., a[-1]], axis=1)
+            else:
+                a[-1] = np.concatenate([np.ones((1, max_len - alen, act_dim)) * -10., a[-1]], axis=1)
             r[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), r[-1]], axis=1)
             d[-1] = np.concatenate([np.ones((1, max_len - tlen)) * 2, d[-1]], axis=1)
             rtg[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), rtg[-1]], axis=1) / scale
@@ -342,6 +387,10 @@ def process_total_data_mean(trajectories, mode):
     traj_lens, returns = np.array(traj_lens), np.array(returns)
 
     # used for input normalization
+    '''
+    TODO
+    process  state mean and std for different length
+    '''
     states = np.concatenate(states, axis=0)
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
@@ -361,6 +410,10 @@ def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
     traj_lens, returns = np.array(traj_lens), np.array(returns)
 
     # used for input normalization
+    '''
+    TODO
+    process state mean and std differently for different morphologies
+    '''
     states = np.concatenate(states, axis=0)
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
@@ -436,7 +489,7 @@ def discount_cumsum(x, gamma):
     return discount_cumsum
 
 """ evaluation """
-
+# @torch.compile
 def eval_episodes(target_rew, info, variant, env, env_name):
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
@@ -471,3 +524,93 @@ def eval_episodes(target_rew, info, variant, env, env_name):
             }
     return fn
 
+def get_agent_config(name):
+    if name == 'halfcheetah':
+        agent = {
+            'state_dim': 17,
+            'act_dim': 6,
+            'num_node': 7,
+            'node_type_state_action_len': {
+                'root': 5,
+                'thigh': 3,
+                'shin': 3,
+                'foot': 3,
+            },
+            'node_type': {
+                'root': 'root',
+                'back_thigh': 'thigh',
+                'back_shin': 'shin',
+                'bach_foot': 'foot',
+                'front_thigh': 'thigh',
+                'front_shin': 'shin',
+                'front_foot': 'foot',
+            },
+            'state_position': {
+                'root': [0, 1, 8, 9, 10],
+                'back_thigh': [2, 11],
+                'back_shin': [3, 12],
+                'bach_foot': [4, 13],
+                'front_thigh': [5, 14],
+                'front_shin': [6, 15],
+                'front_foot': [7, 16],
+            },
+            'action_position': {
+                'root': [],
+                'back_thigh': [0],
+                'back_shin': [1],
+                'bach_foot': [2],
+                'front_thigh': [3],
+                'front_shin': [4],
+                'front_foot': [5],
+            },
+            'edge': [[3, 2], [2, 1], [1, 0], [0, 4], [4, 5], [5, 6]],
+        }
+    elif name == 'ant': 
+        agent = {
+            'state_dim': 27,
+            'act_dim': 8,
+            'num_node': 9,
+            'node_type_state_action_len': {
+                'root': 11,
+                'hip': 3,
+                'ankle': 3,
+            },
+            'node_type': {
+                'root': 'root',
+                'hip_1': 'hip',
+                'ankle_1': 'ankle',
+                'hip_2': 'hip',
+                'ankle_2': 'ankle',
+                'hip_3': 'hip',
+                'ankle_3': 'ankle',
+                'hip_4': 'hip',
+                'ankle_4': 'ankle',
+            },
+            'state_position': {
+                'root': [0, 1, 2, 3, 4, 13, 14, 15, 16, 17, 18],
+                'hip_1': [5, 19],
+                'ankle_1': [6, 20],
+                'hip_2': [7, 21],
+                'ankle_2': [8, 22],
+                'hip_3': [9, 23],
+                'ankle_3': [10, 24],
+                'hip_4': [11, 25],
+                'ankle_4': [12, 26],
+            },
+            'action_position': {
+                'root': [],
+                'hip_1': [0],
+                'ankle_1': [1],
+                'hip_2': [2],
+                'ankle_2': [3],
+                'hip_3': [4],
+                'ankle_3': [5],
+                'hip_4': [6],
+                'ankle_4': [7],
+            },
+            'edge': [[0, 1], [0, 3], [0, 5], [0, 7], [1, 2], [3, 4], [5, 6], [7, 8]],
+        }
+    else:
+        raise NameError('agent name not valid, only "hopper", "halfcheetah" and "walker2d" are implemented')
+    
+    return agent
